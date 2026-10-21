@@ -16,6 +16,9 @@ import dev.lavalink.youtube.*;
 import dev.lavalink.youtube.UrlTools.UrlInfo;
 import dev.lavalink.youtube.cipher.ScriptExtractionException;
 import dev.lavalink.youtube.clients.skeleton.Client;
+import dev.lavalink.youtube.sabr.FormatId;
+import dev.lavalink.youtube.sabr.SabrClientInfo;
+import dev.lavalink.youtube.sabr.SabrStream;
 import dev.lavalink.youtube.track.format.StreamFormat;
 import dev.lavalink.youtube.track.format.TrackFormats;
 import org.apache.http.Header;
@@ -29,10 +32,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 import static com.sedmelluq.discord.lavaplayer.container.Formats.MIME_AUDIO_WEBM;
 import static com.sedmelluq.discord.lavaplayer.tools.DataFormatTools.decodeUrlEncodedItems;
@@ -61,6 +61,29 @@ public class YoutubeAudioTrack extends DelegatedAudioTrack {
     super(trackInfo);
     this.sourceManager = sourceManager;
   }
+
+  private long probeContentLength(HttpInterface httpInterface, URI url) {
+    HttpGet request = new HttpGet(url);
+    request.setHeader("Range", "bytes=0-0");
+
+    try (CloseableHttpResponse response = httpInterface.execute(request)) {
+      Header contentRange = response.getFirstHeader("Content-Range");
+      int totalIndex = contentRange != null ? contentRange.getValue().lastIndexOf('/') : -1;
+
+      if (totalIndex != -1) {
+        String total = contentRange.getValue().substring(totalIndex + 1).trim();
+
+        if (!total.isEmpty() && !"*".equals(total)) {
+          return Long.parseLong(total);
+        }
+      }
+    } catch (Exception e) {
+      log.debug("Failed to probe content length for {}", url, e);
+    }
+
+    return CONTENT_LENGTH_UNKNOWN;
+  }
+
 
   @Override
   public void process(LocalAudioTrackExecutor localExecutor) throws Exception {
@@ -101,6 +124,7 @@ public class YoutubeAudioTrack extends DelegatedAudioTrack {
         } catch (CannotBeLoaded e) {
           throw e;
         } catch (Exception e) {
+          log.debug("Client \"{}\" failed during playback storing and proceeding", client.getIdentifier(), e);
           if (e instanceof ScriptExtractionException) {
             // If we're still early in playback, we can try another client
             if (localExecutor.getPosition() >= BAD_STREAM_POSITION_THRESHOLD_MS) {
@@ -131,7 +155,24 @@ public class YoutubeAudioTrack extends DelegatedAudioTrack {
                                  HttpInterface httpInterface,
                                  Client client,
                                  long streamPosition) throws CannotBeLoaded, Exception {
-    FormatWithUrl augmentedFormat = loadBestFormatWithUrl(httpInterface, client);
+    TrackFormats formats = client.loadFormats(sourceManager, httpInterface, getIdentifier());
+
+    if (formats == null) {
+      throw new FriendlyException("This video cannot be played", Severity.SUSPICIOUS, null);
+    }
+
+    StreamFormat format = formats.getBestFormat();
+
+    if (format == null) {
+      throw new FriendlyException("No supported format found", Severity.SUSPICIOUS, null);
+    }
+
+    if (format.isSabr()) {
+      processSabr(localExecutor, httpInterface, client, formats, format);
+      return;
+    }
+
+    FormatWithUrl augmentedFormat = augmentFormatWithUrl(httpInterface, client, formats, format);
     log.debug("Starting track with URL from client {}: {}", client.getIdentifier(), augmentedFormat.signedUrl);
 
     String query = augmentedFormat.signedUrl.getRawQuery();
@@ -157,6 +198,79 @@ public class YoutubeAudioTrack extends DelegatedAudioTrack {
     } catch (StreamExpiredException e) {
       processWithClient(localExecutor, httpInterface, client, e.lastStreamPosition);
     }
+  }
+
+  private void processSabr(LocalAudioTrackExecutor localExecutor,
+                           HttpInterface httpInterface,
+                           Client client,
+                           TrackFormats formats,
+                           StreamFormat format) throws Exception {
+    SabrClientInfo clientInfo = client.getSabrClientInfo(httpInterface);
+    String serverAbrStreamingUrl = formats.getServerAbrStreamingUrl();
+    String ustreamerConfig = formats.getVideoPlaybackUstreamerConfig();
+
+    if (clientInfo == null || serverAbrStreamingUrl == null || ustreamerConfig == null) {
+      throw new FriendlyException("This video cannot be played", Severity.COMMON,
+          new RuntimeException("Client " + client.getIdentifier() + " does not support SABR playback " +
+              "(missing client info, streaming URL or ustreamer config)"));
+    }
+
+    URI resolvedUrl = resolveSabrUrl(httpInterface, client, formats, format, serverAbrStreamingUrl);
+    byte[] ustreamerBytes = decodeBase64(ustreamerConfig);
+    byte[] poTokenBytes = formats.getPoToken() != null ? decodeBase64(formats.getPoToken()) : null;
+    FormatId formatId = new FormatId(format.getItag(), format.getLastModified(), format.getXtags());
+
+    log.debug("Starting SABR track from client {} (itag {}): {}", client.getIdentifier(), format.getItag(), resolvedUrl);
+
+    try (SabrStream stream = new SabrStream(httpInterface, resolvedUrl, ustreamerBytes, poTokenBytes,
+        clientInfo, formatId, format.isDrc(), format.getContentLength(), trackInfo.length)) {
+      if (format.getType().getMimeType().endsWith("/webm")) {
+        processDelegate(new MatroskaAudioTrack(trackInfo, stream), localExecutor);
+      } else {
+        processDelegate(new MpegAudioTrack(trackInfo, stream), localExecutor);
+      }
+    }
+  }
+
+  @NotNull
+  private URI resolveSabrUrl(HttpInterface httpInterface,
+                             Client client,
+                             TrackFormats formats,
+                             StreamFormat format,
+                             String serverAbrStreamingUrl) throws IOException, URISyntaxException {
+    if (!client.requirePlayerScript()) {
+      return new URI(serverAbrStreamingUrl);
+    }
+
+    UrlTools.UrlInfo urlInfo = UrlTools.getUrlInfo(serverAbrStreamingUrl, true);
+    String nParameter = urlInfo.parameters.get("n");
+
+    if (nParameter == null) {
+      return new URI(serverAbrStreamingUrl);
+    }
+
+    // Reuse the cipher manager's throttling ('n') transform by wrapping the ABR URL in a synthetic format.
+    StreamFormat synthetic = new StreamFormat(format.getType(), format.getItag(), 0, 0, 0,
+        serverAbrStreamingUrl, nParameter, null, "signature", true, false);
+    return sourceManager.getCipherManager().resolveFormatUrl(httpInterface, formats.getPlayerScriptUrl(), synthetic);
+  }
+
+  private static byte[] decodeBase64(@NotNull String input) {
+    // Normalise URL-safe base64 to standard base64 and pad, so both encodings are accepted.
+    String normalized = input.replace('-', '+').replace('_', '/');
+
+    switch (normalized.length() % 4) {
+      case 2:
+        normalized += "==";
+        break;
+      case 3:
+        normalized += "=";
+        break;
+      default:
+        break;
+    }
+
+    return Base64.getDecoder().decode(normalized);
   }
 
   private void processStatic(LocalAudioTrackExecutor localExecutor,
@@ -202,48 +316,20 @@ public class YoutubeAudioTrack extends DelegatedAudioTrack {
     processDelegate(new YoutubeMpegStreamAudioTrack(trackInfo, httpInterface, augmentedFormat.signedUrl), localExecutor);
   }
 
-  private long probeContentLength(HttpInterface httpInterface, URI url) {
-    HttpGet request = new HttpGet(url);
-    request.setHeader("Range", "bytes=0-0");
-
-    try (CloseableHttpResponse response = httpInterface.execute(request)) {
-      Header contentRange = response.getFirstHeader("Content-Range");
-      int totalIndex = contentRange != null ? contentRange.getValue().lastIndexOf('/') : -1;
-
-      if (totalIndex != -1) {
-        String total = contentRange.getValue().substring(totalIndex + 1).trim();
-
-        if (!total.isEmpty() && !"*".equals(total)) {
-          return Long.parseLong(total);
-        }
-      }
-    } catch (Exception e) {
-      log.debug("Failed to probe content length for {}", url, e);
-    }
-
-    return CONTENT_LENGTH_UNKNOWN;
-  }
-
   @NotNull
-  private FormatWithUrl loadBestFormatWithUrl(@NotNull HttpInterface httpInterface,
-                                              @NotNull Client client) throws CannotBeLoaded, Exception {
+  private FormatWithUrl augmentFormatWithUrl(@NotNull HttpInterface httpInterface,
+                                             @NotNull Client client,
+                                             @NotNull TrackFormats formats,
+                                             @NotNull StreamFormat format) throws CannotBeLoaded, Exception {
     if (!client.supportsFormatLoading()) {
       throw new RuntimeException(client.getIdentifier() + " does not support loading of formats!");
     }
-
-    TrackFormats formats = client.loadFormats(sourceManager, httpInterface, getIdentifier());
-
-    if (formats == null) {
-      throw new FriendlyException("This video cannot be played", Severity.SUSPICIOUS, null);
-    }
-
-    StreamFormat format = formats.getBestFormat();
 
     URI resolvedUrl = format.getUrl();
     if (client.requirePlayerScript()) {
       resolvedUrl = sourceManager.getCipherManager()
               .resolveFormatUrl(httpInterface, formats.getPlayerScriptUrl(), format);
-      resolvedUrl = client.transformPlaybackUri(format.getUrl(), resolvedUrl);
+      resolvedUrl = client.transformPlaybackUri(format.getUrl(), resolvedUrl, formats.getPoToken());
     }
 
     return new FormatWithUrl(format, resolvedUrl);
