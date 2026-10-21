@@ -40,7 +40,7 @@ java {
 }
 
 mavenPublishing {
-    coordinates("dev.lavalink.youtube", "youtube-plugin", version.toString())
+    coordinates(group.toString(), "youtube-plugin", version.toString())
     configure(JavaLibrary(JavadocJar.None(), sourcesJar = false))
 }
 

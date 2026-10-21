@@ -10,7 +10,7 @@ val (gitVersion, release) = versionFromGit()
 logger.lifecycle("Version: $gitVersion (release: $release)")
 
 allprojects {
-    group = "dev.lavalink.youtube"
+    group = "net.hycrafthd.lavaplayer-extras.youtube-source"
     // The plugin project is the only one that should not have a snapshot version since lavalink expects the jar name to be specific
     version = if (project.name == "plugin") {
         gitVersion.removeSuffix("-SNAPSHOT")
@@ -33,6 +33,10 @@ subprojects {
 
     tasks.withType<JavaCompile>().configureEach {
         options.encoding = "UTF-8"
+        // Also reject Java 9+ APIs, which sourceCompatibility alone does not. The Lavalink plugin targets Java 11.
+        if (project.name != "plugin") {
+            options.release.set(8)
+        }
     }
 
     configure<JavaPluginExtension> {
@@ -45,8 +49,8 @@ subprojects {
         val mavenPassword = findProperty("MAVEN_PASSWORD") as String?
         if (!mavenUsername.isNullOrEmpty() && !mavenPassword.isNullOrEmpty()) {
             repositories {
-                val snapshots = "https://maven.lavalink.dev/snapshots"
-                val releases = "https://maven.lavalink.dev/releases"
+                val snapshots = "https://repo-snapshots.u-team.info"
+                val releases = "https://repo.u-team.info"
 
                 maven(if (release) releases else snapshots) {
                     credentials {
@@ -56,7 +60,7 @@ subprojects {
                 }
             }
         } else {
-            logger.lifecycle("Not publishing to maven.lavalink.dev because credentials are not set")
+            logger.lifecycle("Not publishing to repo.u-team.info because credentials are not set")
         }
     }
 }
